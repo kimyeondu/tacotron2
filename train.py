@@ -3,6 +3,7 @@ import time
 import argparse
 import math
 from numpy import finfo
+from tqdm import tqdm
 
 import torch
 from distributed import apply_gradient_allreduce
@@ -129,21 +130,39 @@ def validate(model, criterion, valset, iteration, batch_size, n_gpus,
                                 pin_memory=False, collate_fn=collate_fn)
 
         val_loss = 0.0
+        val_mel_loss = 0.0
+        val_gate_loss = 0.0
+
         for i, batch in enumerate(val_loader):
             x, y = model.parse_batch(batch)
             y_pred = model(x)
-            loss = criterion(y_pred, y)
+
+            # loss = criterion(y_pred, y)
+            mel_loss, gate_loss = criterion(y_pred, y)
+            loss = mel_loss+gate_loss
+            
             if distributed_run:
                 reduced_val_loss = reduce_tensor(loss.data, n_gpus).item()
+                reduced_val_mel_loss = reduce_tensor(loss.data, n_gpus).item()
+                reduced_val_gate_loss = reduce_tensor(loss.data, n_gpus).item()
+
             else:
                 reduced_val_loss = loss.item()
+                reduced_mel_loss = mel_loss.item()
+                reduced_gate_loss = gate_loss.item()
+
             val_loss += reduced_val_loss
+            val_mel_loss += reduced_mel_loss
+            val_gate_loss += reduced_gate_loss
+
         val_loss = val_loss / (i + 1)
+        val_mel_loss = val_mel_loss / (i + 1)
+        val_gate_loss = val_gate_loss / (i + 1)
 
     model.train()
     if rank == 0:
-        print("Validation loss {}: {:9f}  ".format(iteration, val_loss))
-        logger.log_validation(val_loss, model, y, y_pred, iteration)
+        print("Validation total_loss {:9f} mel_loss {:9f} gate_loss {:9f} ".format(iteration, val_loss, val_mel_loss, val_gate_loss))
+        logger.log_validation(val_loss, val_mel_loss, val_gate_loss, model, y, y_pred, iteration)
 
 
 def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
@@ -165,7 +184,9 @@ def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
     torch.manual_seed(hparams.seed)
     torch.cuda.manual_seed(hparams.seed)
 
+  
     model = load_model(hparams)
+    
     learning_rate = hparams.learning_rate
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate,
                                  weight_decay=hparams.weight_decay)
@@ -203,7 +224,7 @@ def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
     model.train()
     is_overflow = False
     # ================ MAIN TRAINNIG LOOP! ===================
-    for epoch in range(epoch_offset, hparams.epochs):
+    for epoch in tqdm(range(epoch_offset, hparams.epochs)):
         print("Epoch: {}".format(epoch))
         for i, batch in enumerate(train_loader):
             start = time.perf_counter()
@@ -214,11 +235,16 @@ def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
             x, y = model.parse_batch(batch)
             y_pred = model(x)
 
-            loss = criterion(y_pred, y)
+            mel_loss, gate_loss = criterion(y_pred, y)
+            loss = mel_loss+gate_loss
+
             if hparams.distributed_run:
                 reduced_loss = reduce_tensor(loss.data, n_gpus).item()
             else:
                 reduced_loss = loss.item()
+                reduced_mel_loss = mel_loss.item()
+                reduced_gate_loss = gate_loss.item()
+
             if hparams.fp16_run:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
@@ -237,10 +263,10 @@ def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
 
             if not is_overflow and rank == 0:
                 duration = time.perf_counter() - start
-                print("Train loss {} {:.6f} Grad Norm {:.6f} {:.2f}s/it".format(
-                    iteration, reduced_loss, grad_norm, duration))
+                print("Train {} | total_loss {:.6f} mel_loss {:.6f} gate_loss {:.6f} | Grad Norm {:.6f} {:.2f}s/it".format(
+                    iteration, reduced_loss, reduced_mel_loss, reduced_gate_loss, grad_norm, duration))
                 logger.log_training(
-                    reduced_loss, grad_norm, learning_rate, duration, iteration)
+                    reduced_loss, reduced_mel_loss, reduced_gate_loss, grad_norm, learning_rate, duration, iteration)
 
             if not is_overflow and (iteration % hparams.iters_per_checkpoint == 0):
                 validate(model, criterion, valset, iteration,
